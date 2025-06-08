@@ -35,7 +35,7 @@ from .mlp_scm import MLPSCM
 from .tree_scm import TreeSCM
 
 from .hp_sampling import HpSamplerList
-from .reg2cls import Reg2Cls
+from .survival import RegressionToSurvival
 from .prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
 
 
@@ -525,7 +525,7 @@ class SCMPrior(Prior):
         return hp_sampler.sample()
 
     @torch.no_grad()
-    def generate_dataset(self, params: Dict[str, Any]) -> Tuple[Tensor, Tensor, Tensor]:
+    def generate_dataset(self, params: Dict[str, Any]) -> Tuple[Tensor, Tuple[Tensor, Tensor], Tensor]:
         """
         Generates a single valid dataset based on the provided parameters.
 
@@ -538,9 +538,9 @@ class SCMPrior(Prior):
         Returns
         -------
         tuple
-            (X, y, d) where:
+            (X, y_survival, d) where:
             - X: Features tensor of shape (seq_len, max_features)
-            - y: Labels tensor of shape (seq_len,)
+            - y_survival: Tuple of (event_indicator, observed_time)
             - d: Number of active features after filtering (scalar Tensor)
         """
 
@@ -552,20 +552,25 @@ class SCMPrior(Prior):
             raise ValueError(f"Unknown prior type {params['prior_type']}")
 
         while True:
-            X, y = prior_cls(**params)()
-            X, y = Reg2Cls(params)(X, y)
+            X, y_continuous = prior_cls(**params)()
+            X, (y_event, y_time) = RegressionToSurvival(params)(X, y_continuous)
 
-            # Add batch dim for single dataset to be compatible with delete_unique_features and sanity_check
-            X, y = X.unsqueeze(0), y.unsqueeze(0)
+            # Combine survival targets for sanity check (ensure events 0 and 1 both present)
+            y_check = y_event
+
+            # Add batch dim for compatibility with checks
+            X_b = X.unsqueeze(0)
+            y_check_b = y_check.unsqueeze(0)
             d = torch.tensor([params["num_features"]], device=self.device, dtype=torch.long)
 
-            # Only keep valid datasets with sufficient features and balanced classes
-            X, d = self.delete_unique_features(X, d)
-            if (d > 0).all() and self.sanity_check(X, y, params["train_size"]):
-                return X.squeeze(0), y.squeeze(0), d.squeeze(0)
+            # Only keep valid datasets
+            X_b, d = self.delete_unique_features(X_b, d)
+            if (d > 0).all() and self.sanity_check(X_b, y_check_b, params["train_size"]):
+                y_survival = (y_event, y_time)
+                return X_b.squeeze(0), y_survival, d.squeeze(0)
 
     @torch.no_grad()
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tuple[Tensor, Tensor], Tensor, Tensor, Tensor]:
         """
         Generates a batch of datasets by first creating a parameter list and then processing it.
 
@@ -580,9 +585,10 @@ class SCMPrior(Prior):
             Features tensor. If seq_len_per_gp=False, shape is (batch_size, seq_len, max_features).
             If seq_len_per_gp=True, returns a NestedTensor.
 
-        y : Tensor or NestedTensor
-            Labels tensor. If seq_len_per_gp=False, shape is (batch_size, seq_len).
-            If seq_len_per_gp=True, returns a NestedTensor.
+        y : Tuple[Tensor, Tensor] or Tuple[NestedTensor, NestedTensor]
+            Survival targets as (event_indicator, observed_time). If seq_len_per_gp=False,
+            each is a tensor of shape (batch_size, seq_len). If seq_len_per_gp=True,
+            returns a pair of NestedTensors.
 
         d : Tensor
             Number of active features per dataset after filtering, shape (batch_size,)
@@ -687,17 +693,22 @@ class SCMPrior(Prior):
         else:
             results = [self.generate_dataset(params) for params in param_list]
 
-        X_list, y_list, d_list = zip(*results)
+        X_list, y_survival_list, d_list = zip(*results)
+        y_event_list, y_time_list = zip(*y_survival_list)
 
         # Combine Results
         if self.seq_len_per_gp:
             # Use nested tensors for variable sequence lengths
             X = nested_tensor([x.to(self.device) for x in X_list], device=self.device)
-            y = nested_tensor([y.to(self.device) for y in y_list], device=self.device)
+            y_event = nested_tensor([ye.to(self.device) for ye in y_event_list], device=self.device)
+            y_time = nested_tensor([yt.to(self.device) for yt in y_time_list], device=self.device)
         else:
             # Stack into regular tensors for fixed sequence length
             X = torch.stack(X_list).to(self.device)  # (B, T, H)
-            y = torch.stack(y_list).to(self.device)  # (B, T)
+            y_event = torch.stack(y_event_list).to(self.device)  # (B, T)
+            y_time = torch.stack(y_time_list).to(self.device)  # (B, T)
+
+        y = (y_event, y_time)
 
         # Metadata (always regular tensors)
         d = torch.stack(d_list).to(self.device)  # Actual number of features after filtering out constant ones
@@ -1011,12 +1022,12 @@ class PriorDataset(IterableDataset):
 
             2. For DummyPrior, random Gaussian values of (batch_size, seq_len, max_features).
 
-        X : Tensor or NestedTensor
+        y : Tensor or NestedTensor or Tuple[Tensor, Tensor] or Tuple[NestedTensor, NestedTensor]
             1. For SCM-based priors:
-             - If seq_len_per_gp=False, shape is (batch_size, seq_len).
-             - If seq_len_per_gp=True, returns a NestedTensor.
+             - If seq_len_per_gp=False, returns a tuple (event_indicator, observed_time) each of shape (batch_size, seq_len).
+             - If seq_len_per_gp=True, returns a pair of NestedTensors.
 
-            2. For DummyPrior, random class labels of (batch_size, seq_len).
+            2. For DummyPrior, random class labels tensor of shape (batch_size, seq_len).
 
         d : Tensor
             Number of active features per dataset of shape (batch_size,).
