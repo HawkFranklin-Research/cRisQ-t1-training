@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 from typing import Optional
-from collections import OrderedDict
-
 import torch
 from torch import nn, Tensor
 
 from .encoders import Encoder
-from .inference import InferenceManager
-from .inference_config import MgrConfig
 
 
 class RowInteraction(nn.Module):
@@ -84,8 +80,6 @@ class RowInteraction(nn.Module):
 
         self.out_ln = nn.LayerNorm(embed_dim) if norm_first else nn.Identity()
 
-        self.inference_mgr = InferenceManager(enc_name="tf_row", out_dim=embed_dim * self.num_cls, out_no_seq=True)
-
     def _aggregate_embeddings(self, embeddings: Tensor, key_mask: Optional[Tensor] = None) -> Tensor:
         """Process a batch of rows through a transformer encoder.
 
@@ -158,50 +152,8 @@ class RowInteraction(nn.Module):
 
         return representations  # (B, T, C*E)
 
-    def _inference_forward(self, embeddings: Tensor, mgr_config: MgrConfig = None) -> Tensor:
-        """Transform feature embeddings into row representations for inference.
 
-        Parameters
-        ----------
-        embeddings : Tensor
-            Feature embeddings of shape (B, T, H+C, E) where:
-             - B is the number of tables
-             - T is the number of samples (rows)
-             - H is the number of features
-             - C is the number of class tokens
-             - E is the embedding dimension
-
-        mgr_config : MgrConfig, default=None
-            Configuration for InferenceManager
-
-        Returns
-        -------
-        Tensor
-            Row representations of shape (B, T, C*E) where C is the number of class tokens
-        """
-        # Configure inference parameters
-        if mgr_config is None:
-            mgr_config = MgrConfig(
-                min_batch_size=1,
-                safety_factor=0.8,
-                offload=False,
-                auto_offload_pct=0.5,
-                device=None,
-                use_amp=True,
-                verbose=False,
-            )
-        self.inference_mgr.configure(**mgr_config)
-
-        B, T = embeddings.shape[:2]
-        cls_tokens = self.cls_tokens.expand(B, T, self.num_cls, self.embed_dim)
-        embeddings[:, :, : self.num_cls] = cls_tokens.to(embeddings.device)
-        representations = self.inference_mgr(
-            self._aggregate_embeddings, inputs=OrderedDict([("embeddings", embeddings)])
-        )
-
-        return representations  # (B, T, C*E)
-
-    def forward(self, embeddings: Tensor, d: Optional[Tensor] = None, mgr_config: MgrConfig = None) -> Tensor:
+    def forward(self, embeddings: Tensor, d: Optional[Tensor] = None) -> Tensor:
         """Transform feature embeddings into row representations.
 
         Parameters
@@ -217,8 +169,6 @@ class RowInteraction(nn.Module):
         d : Optional[Tensor], default=None
             The number of features per dataset. Used only in training mode.
 
-        mgr_config : MgrConfig, default=None
-            Configuration for InferenceManager. Used only in inference mode.
 
         Returns
         -------
@@ -226,9 +176,6 @@ class RowInteraction(nn.Module):
             Row representations of shape (B, T, C*E) where C is the number of class tokens
         """
 
-        if self.training:
-            representations = self._train_forward(embeddings, d)
-        else:
-            representations = self._inference_forward(embeddings, mgr_config)
+        representations = self._train_forward(embeddings, d)
 
         return representations  # (B, T, C*E)
