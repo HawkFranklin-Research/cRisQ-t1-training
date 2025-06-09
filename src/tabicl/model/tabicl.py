@@ -143,8 +143,8 @@ class TabICL(nn.Module):
         )
 
     def _train_forward(
-        self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False
-    ) -> Tensor:
+        self, X: Tensor, y_train: tuple[Tensor, Tensor], d: Optional[Tensor] = None, embed_with_test: bool = False
+    ) -> dict[str, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning for training.
 
         Parameters
@@ -156,22 +156,22 @@ class TabICL(nn.Module):
              - H is the number of features (columns)
             The first train_size positions contain training samples, and the remaining positions contain test samples.
 
-        y_train : Tensor
-            Training labels of shape (B, train_size) where:
-             - B is the number of tables
-             - train_size is the number of training samples provided for in-context learning
+        y_train : tuple[Tensor, Tensor]
+            Tuple of (event, time) training labels, each of shape (B, train_size) where:
+            - B is the number of tables
+            - train_size is the number of training samples provided for in-context learning
 
         d : Optional[Tensor], default=None
             The number of features per dataset.
 
         Returns
         -------
-        Tensor
-            Raw logits of shape (B, T, max_classes), which will be further handled by the training code.
+        dict[str, Tensor]
+            Dictionary with classification logits and time predictions for the test portion.
         """
 
         B, T, H = X.shape
-        train_size = y_train.shape[1]
+        train_size = y_train[0].shape[1]
         assert train_size <= T, "Number of training samples exceeds total samples"
 
         # Check if d is provided and has the same length as the number of features
@@ -192,10 +192,10 @@ class TabICL(nn.Module):
     def forward(
         self,
         X: Tensor,
-        y_train: Tensor,
+        y_train: tuple[Tensor, Tensor],
         d: Optional[Tensor] = None,
         embed_with_test: bool = False,
-    ) -> Tensor:
+    ) -> dict[str, Tensor]:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
         Parameters
@@ -207,10 +207,10 @@ class TabICL(nn.Module):
              - H is the number of features (columns)
             The first train_size positions contain training samples, and the remaining positions contain test samples.
 
-        y_train : Tensor
-            Training labels of shape (B, train_size) where:
-             - B is the number of tables
-             - train_size is the number of training samples provided for in-context learning
+        y_train : tuple[Tensor, Tensor]
+            Tuple of (event, time) training labels, each of shape (B, train_size) where:
+            - B is the number of tables
+            - train_size is the number of training samples provided for in-context learning
 
         d : Optional[Tensor], default=None
             The number of features per dataset. Used only in training mode.
@@ -220,12 +220,8 @@ class TabICL(nn.Module):
 
         Returns
         -------
-        Tensor
-            For training mode:
-              Raw logits of shape (B, T-train_size, max_classes), which will be further handled by the training code.
-
-            For inference mode:
-              Raw logits or probabilities for test samples of shape (B, T-train_size, num_classes).
+        dict[str, Tensor]
+            Dictionary with classification logits and time predictions for the test portion.
         """
 
         out = self._train_forward(X, y_train, d=d, embed_with_test=embed_with_test)
