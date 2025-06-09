@@ -500,7 +500,7 @@ class Trainer:
 
         return seq_len, train_size
 
-    def align_micro_batch(self, micro_X, micro_y, micro_d, seq_len):
+    def align_micro_batch(self, micro_X, micro_y_event, micro_y_time, micro_d, seq_len):
         """
         Truncate micro batch tensors to required dimensions.
 
@@ -513,8 +513,11 @@ class Trainer:
         micro_X : Tensor (B, T, H)
             Input features per dataset.
 
-        micro_y : Tensor (B, T)
-            Target labels per dataset.
+        micro_y_event : Tensor (B, T)
+            Event labels per dataset.
+
+        micro_y_time : Tensor (B, T)
+            Time-to-event labels per dataset.
 
         micro_d : Tensor (B,)
             Number of active features per dataset.
@@ -524,23 +527,26 @@ class Trainer:
 
         Returns
         -------
-        tuple (Tensor, Tensor)
-            Truncated (micro_X, micro_y) tensors with shapes
+        tuple (Tensor, Tensor, Tensor)
+            Truncated (micro_X, micro_y_event, micro_y_time) tensors with shapes
             (B, seq_len, micro_d.max()) and (B, seq_len).
         """
         # Truncate sequence length
         if micro_X.shape[1] > seq_len:
             micro_X = micro_X[:, :seq_len]
 
-        if micro_y.shape[1] > seq_len:
-            micro_y = micro_y[:, :seq_len]
+        if micro_y_event.shape[1] > seq_len:
+            micro_y_event = micro_y_event[:, :seq_len]
+
+        if micro_y_time.shape[1] > seq_len:
+            micro_y_time = micro_y_time[:, :seq_len]
 
         # Truncate feature dimension
         max_features = micro_d.max().item()
         if micro_X.shape[-1] > max_features:
             micro_X = micro_X[..., :max_features]
 
-        return micro_X, micro_y
+        return micro_X, micro_y_event, micro_y_time
 
     def run_micro_batch(self, micro_batch, micro_batch_idx, num_micro_batches):
         """Process a micro batch for gradient accumulation.
@@ -548,7 +554,7 @@ class Trainer:
         Parameters
         ----------
         micro_batch : tuple
-            (micro_X, micro_y, micro_d, micro_seq_len, micro_train_size) tensors for the micro batch
+            (micro_X, micro_y_event, micro_y_time, micro_d, micro_seq_len, micro_train_size) tensors for the micro batch
 
         micro_batch_idx : int
             Index of the current micro batch
@@ -561,27 +567,36 @@ class Trainer:
         dict
             Result dictionary
         """
-        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
+        micro_X, micro_y_event, micro_y_time, micro_d, micro_seq_len, micro_train_size = micro_batch
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
-        micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
+        micro_X, micro_y_event, micro_y_time = self.align_micro_batch(micro_X, micro_y_event, micro_y_time, micro_d, seq_len)
 
         # Move to device
         micro_X = micro_X.to(self.config.device)
-        micro_y = micro_y.to(self.config.device)
+        micro_y_event = micro_y_event.to(self.config.device)
+        micro_y_time = micro_y_time.to(self.config.device)
         micro_d = micro_d.to(self.config.device)
 
-        y_train = micro_y[:, :train_size]
-        y_test = micro_y[:, train_size:]
+        y_event_train = micro_y_event[:, :train_size]
+        y_time_train = micro_y_time[:, :train_size]
+        y_event_test = micro_y_event[:, train_size:]
+        y_time_test = micro_y_time[:, train_size:]
 
         # Set DDP gradient sync for last micro batch only
         if self.ddp:
             self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
 
         with self.amp_ctx:
-            pred = self.model(micro_X, y_train, micro_d)  # (B, test_size, max_classes)
-            pred = pred.flatten(end_dim=-2)
-            true = y_test.long().flatten()
-            loss = F.cross_entropy(pred, true)
+            predictions = self.model(micro_X, (y_event_train, y_time_train), micro_d)
+            event_logits = predictions["logits"].flatten()
+            time_pred = predictions["time"].flatten()
+            true_event = y_event_test.flatten()
+            true_time = y_time_test.flatten()
+
+            loss_event = F.binary_cross_entropy_with_logits(event_logits, true_event)
+            loss_time = F.mse_loss(time_pred, true_time)
+            alpha = 0.1
+            loss = loss_event + alpha * loss_time
 
         # Scale loss for gradient accumulation and backpropagate
         scaled_loss = loss / num_micro_batches
@@ -589,8 +604,8 @@ class Trainer:
 
         with torch.no_grad():
             micro_results = {}
-            micro_results["ce"] = scaled_loss.item()
-            accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
+            micro_results["loss"] = scaled_loss.item()
+            accuracy = ((torch.sigmoid(event_logits) > 0.5) == true_event).sum() / len(true_event)
             micro_results["accuracy"] = accuracy.item() / num_micro_batches
 
         return micro_results
@@ -605,13 +620,13 @@ class Trainer:
         Parameters
         ----------
         batch: tuple
-            Contains tensors (X, y, d, seq_len, train_size) for the batch.
-            X and y can be Tensors or NestedTensors (for variable sequence lengths).
+            Contains tensors (X, (y_event, y_time), d, seq_len, train_size) for the batch.
+            X, y_event, and y_time can be Tensors or NestedTensors (for variable sequence lengths).
 
         Returns
         ------
         dict
-            Dictionary containing 'ce' (cross-entropy loss) and 'accuracy'.
+            Dictionary containing 'loss' and 'accuracy'.
 
         Raises
         ------
@@ -621,15 +636,21 @@ class Trainer:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
+        # Unpack survival targets
+        X, y, d, seq_len, train_size = batch
+        y_event, y_time = y
+        batch = [X, y_event, y_time, d, seq_len, train_size]
+
         # Pad nested tensors to the same size
         batch = [t.to_padded_tensor(padding=0.0) if t.is_nested else t for t in batch]
+        X, y_event, y_time, d, seq_len, train_size = batch
 
         # Split the batch into micro-batches along the first dimension
         num_micro_batches = math.ceil(self.config.batch_size / self.config.micro_batch_size)
-        micro_batches = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch]
+        micro_batches = [torch.split(t, self.config.micro_batch_size, dim=0) for t in [X, y_event, y_time, d, seq_len, train_size]]
         micro_batches = list(zip(*micro_batches))
 
-        results = {"ce": 0.0, "accuracy": 0.0}
+        results = {"loss": 0.0, "accuracy": 0.0}
         failed_batches = 0
 
         for idx, micro_batch in enumerate(micro_batches):
