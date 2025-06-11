@@ -14,7 +14,6 @@ The original TabICL model was designed for classification. To adapt it for survi
         * An **event indicator** (binary: 1 for event observed, 0 for censored).
         * An **observed time-to-event** (continuous).
     * This is achieved through a random censoring mechanism applied to the SCM's output.
-    * The original classification-focused generators are kept intact under `src/tabicl_prior` for reference and standalone data creation.
 
 2.  **🧠 Multi-Task Prediction Head**:
     * The final `ICLearning` module of the TabICL model has been modified (`src/tabicl/model/learning.py`).

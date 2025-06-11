@@ -55,7 +55,7 @@ Source = "https://github.com/soda-inria/tabicl"
 only-include = ["src/tabicl", "figures", "LICENSE", "README.md"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/tabicl", "src/tabicl_prior"]
+packages = ["src/tabicl"]
 
 [tool.hatch.envs.default]
 installer = "uv"
