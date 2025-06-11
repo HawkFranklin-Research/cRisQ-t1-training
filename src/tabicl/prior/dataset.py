@@ -731,6 +731,8 @@ class SCMPrior(Prior):
         str
             The selected prior type name
         """
+        if self.prior_type == "survival_scm":
+            return "survival_scm"
         if self.prior_type == "mix_scm":
             return np.random.choice(["mlp_scm", "tree_scm"], p=self.fixed_hp.get("mix_probas", [0.7, 0.3]))
         else:
