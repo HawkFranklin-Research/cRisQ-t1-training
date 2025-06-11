@@ -26,6 +26,7 @@ from tabicl.prior.dataset import PriorDataset
 from tabicl.prior.genload import LoadPriorDataset
 from tabicl.train.optim import get_scheduler
 from tabicl.train.train_config import build_parser
+from tabicl.model.survival_head import cox_ph_nll
 
 warnings.filterwarnings(
     "ignore", message=".*The PyTorch API of nested tensors is in prototype stage.*", category=UserWarning
@@ -586,17 +587,16 @@ class Trainer:
         if self.ddp:
             self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
 
+        # ------------------------------------------------------------------ #
+        #  forward + survival loss                                           #
+        # ------------------------------------------------------------------ #
         with self.amp_ctx:
-            predictions = self.model(micro_X, (y_event_train, y_time_train), micro_d)
-            event_logits = predictions["logits"].flatten()
-            time_pred = predictions["time"].flatten()
+            preds = self.model(micro_X, (y_event_train, y_time_train), micro_d)
+            # risk score (scalar) from the regression head
+            risk = preds["time"].flatten()          # reuse existing regression output
+            loss = cox_ph_nll(risk, y_time_test.flatten(), y_event_test.flatten())
+            event_logits = preds["logits"].flatten()
             true_event = y_event_test.flatten()
-            true_time = y_time_test.flatten()
-
-            loss_event = F.binary_cross_entropy_with_logits(event_logits, true_event)
-            loss_time = F.mse_loss(time_pred, true_time)
-            alpha = 0.1
-            loss = loss_event + alpha * loss_time
 
         # Scale loss for gradient accumulation and backpropagate
         scaled_loss = loss / num_micro_batches
